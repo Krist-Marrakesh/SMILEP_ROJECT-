@@ -1,0 +1,32 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# HuggingFace model cache
+.cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code workspace files
+.claude/
+
+# Local model cache directory (downloaded weights)
+models/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# EDA debug artefacts (the scripts are kept; their CSV output is not)
+eda_dataset_with_features.csv
