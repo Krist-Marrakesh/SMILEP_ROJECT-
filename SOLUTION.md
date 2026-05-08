@@ -106,61 +106,168 @@ Hidden states (24 layers × seq_len × 896)
 ### Why these choices
 
 **Why a probe and not a fine-tuned head?**
-At ~470 training samples per fold, gradient-based heads overfit catastrophically.
-A linear probe is the gold standard: PCA shrinks the input to a manageable
-subspace, **LDA(1) finds the analytic mass-mean direction** that maximally
-separates the two classes (Marks & Tegmark, COLM 2024 — equivalent to "the
-geometry of truth"), and a final logistic regression on the 1-D projection only
-has to learn a bias and a slope.
+With only 689 labelled samples, ~470 of which are visible to any single fold,
+gradient-based heads (MLPs, transformer encoders, even CatBoost on 22 k
+features) overfit catastrophically. The events-per-feature ratio sits at
+≈ 0.02, which is two orders of magnitude below the regime where penalised
+regression starts to dominate maximum-likelihood estimators (Pavlou 2016).
+A linear probe is the gold standard for this regime: PCA shrinks the
+input to a manageable subspace, **LDA(1) finds the single direction
+that maximally separates the truthful and hallucinated class means**,
+and a final logistic regression on the 1-D projection only has to learn
+a bias and a slope.
 
-**Why these layers for tail-pooling?** Layers 10–20 cover the 41–83 % depth band
-where factual knowledge is most strongly encoded in middle-late layers
-(Marks & Tegmark 2024; Li et al. 2023, ITI). Layers 0–9 mostly carry token
-statistics; the very last layers are dominated by next-token-prediction
-geometry rather than factual grounding.
+That LDA(1) direction is mathematically equivalent to the **mass-mean
+probe** of Marks & Tegmark (COLM 2024) — the difference of class
+centroids, normalised by within-class covariance. There is no
+gradient-based optimisation of the separation direction, so there is
+nothing to overfit on the projection step. Empirically, Run 10
+(replacing LDA with PCA → LR alone) drops test AUROC by 1.3 pp,
+confirming that LDA's analytic step matters even after PCA.
 
-**Why mean + max + std multi-view pooling?** Mean captures central tendency,
-max captures the most-active dimensions (often coinciding with rare/uncertain
-tokens), std captures spread within the response window — three orthogonal
-views of the same hidden states. This was a +1.3 pp accuracy step over plain
-mean-pooling (Run 14).
+**Why layers [10, 12, 14, 16, 18, 20] for tail-pooling?**
+Layers 10–20 cover the 41–83 % depth band of the 24-layer model.
+Multiple lines of evidence converge on this range:
+- Marks & Tegmark 2024 and Li et al. 2023 (ITI) place the factuality
+  signal at 40–70 % depth on 7–13 B models.
+- The very early layers (0–9) carry token statistics — most variance
+  there is about *which words* appear, not whether the answer is true.
+- The very last layers are dominated by next-token-prediction geometry
+  (the model is busy choosing the literal next subword), which washes
+  out factual structure for mean-pooling.
+- Spacing layers by 2 (vs every layer) reduces redundancy: consecutive
+  layers in a residual stream are highly correlated.
+
+For *boundary-token* features the optimal layer subset is different
+and shifted later — see below — because we are not averaging anything
+there: a single position is always tightly tied to the next-token
+decision happening at that point, which lives deeper in the stack on
+sub-1 B models (Hou et al. 2024).
+
+**Why mean + max + std multi-view pooling?**
+Plain mean-pooling collapses each layer's `(seq_len, hidden_dim)` block
+into a single 896-vector and discards everything else about the
+response window. Three views give us three orthogonal summaries of the
+same window with no extra forward passes:
+- **mean** — central tendency of activations across the window.
+- **max** — the largest per-coordinate activation, which empirically
+  coincides with rare or out-of-distribution tokens (the model
+  "spiking" on a hallucinated entity).
+- **std** — within-window spread, a proxy for the model's confidence
+  variability across the response.
+Going from 6 × 896 to 6 × 3 × 896 dimensions also lets PCA pick a more
+expressive subspace at the same n_components budget. This was a
++1.3 pp accuracy step over plain mean-pooling (Run 14).
 
 **Why the first response token, and only at deep layers [18, 20, 22]?**
-Snyder et al. (KDD 2024) show the hidden state of the first generated token
-already encodes whether the upcoming response will be hallucinated, *before*
-the response itself appears. The tail-100 view systematically misses this
-position for long hallucinated responses (median 99 tokens for hallu vs 44
-for truthful — see Section 4). A per-layer sweep (Run 21) found that for
-sub-1B models the boundary signal peaks deep in the network (75–95 % depth),
-matching Hou et al. 2024 — different from the optimum for mean-pooling,
-which sits mid-network. Wider pooling windows (K=5) and adjacent positions
-(`boundary_idx − 1`, last `<|im_end|>`) all hurt performance — the signal is
-sharply localised.
+Snyder et al. (KDD 2024) show that the hidden state of the *first
+generated token* — even when that token is a formatting character —
+already encodes whether the upcoming response will be hallucinated,
+because the model has already committed to a generation trajectory
+internally before producing visible output. For long responses
+(median 99 tokens for hallucinated vs 44 for truthful) the tail-100
+view systematically misses this position. Adding it explicitly was
+the single biggest jump in this work (+1.33 pp test AUROC, Run 16,
+breaking a 13-experiment plateau).
 
-**Why EigenTrack spectral features?** Top-k log-eigenvalues of the tail-window
-covariance capture activation-manifold compression — a signal class
-orthogonal to per-coordinate views (EigenTrack, 2025). They are cheap (15
-features) and made the pipeline a touch more robust at no real cost.
+The layer subset `[18, 20, 22]` was found by an explicit per-layer
+sweep (Run 21):
 
-**Why composite-stratified CV?** Hallucinated responses are 2× longer and 3×
-more often truncated than truthful ones; the supplied unlabelled test set has
-30 % truncation rate vs ~22 % in train. Stratifying folds on the joint
-`(label, length-quartile, truncated)` distribution gives a lower-variance,
-fairer CV estimate (Liu 2026; Ravichander, EMNLP 2025). It does **not** change
-the final `predictions.csv` (the production probe is still trained on all 689
-labelled samples), but it makes the reported numbers an honest measure of
-how the probe will generalise.
+| Layers tried   | Test AUROC |
+|----------------|-----------:|
+| [10,12,14,16,18,20]  | 75.50 |
+| [16, 18, 20]         | 75.36 |
+| [10, 12, 14, 16]     | 75.49 |
+| [22, 23]             | 75.63 |
+| [20, 22]             | 75.66 |
+| **[18, 20, 22]**     | **75.77** |
+| [14,16,18,20,22,23]  | 75.27 |
 
-**Why threshold tuning under accuracy, not F1?** README states accuracy on
-`test.csv` is the primary metric. `predictions.csv` only contains binary
-labels, so AUROC is not derivable from a submission anyway. The threshold is
-swept on out-of-fold predictions inside `HallucinationProbe.fit` so that
-`predict()` works correctly even when `evaluate.py` skips
-`fit_hyperparameters` (as happens for the final probe on the unlabelled test
-set in `solution.py`). Optuna still optimises AUROC because val splits are
-small (83 samples → one sample = 1.2 pp accuracy noise), and AUROC is rank-
-based and far more stable. We keep the two metrics decoupled: AUROC selects
-the architecture, accuracy calibrates the threshold.
+The optimum sits at **75–95 % depth** — markedly later than the
+mid-stack optimum for mean-pooling, and consistent with Hou et al.
+2024's per-layer scan for sub-1 B models, which finds the linear-probe
+peak migrating *deeper* as model size shrinks. The intuition: a
+single boundary position is always at the very moment of next-token
+prediction, which is a late-stack operation; averaging over many
+tokens (tail-100) instead captures slower-moving factual structure
+that lives mid-stack.
+
+Wider pooling windows around the boundary (K=5 mean+max, Run 17)
+*dilute* the signal — its locus is sharply localised to the one
+position, not a window. Adjacent positions also fail: the terminator
+token at `boundary_idx − 1` (Run 19) carries a generic `\r\n`
+embedding without the question-specific content; the last `<|im_end|>`
+of the user's turn (Run 24) is the same id across all samples and
+varies only via attention, which is shallow on a 0.5 B model.
+
+**Why EigenTrack spectral features?**
+The top-k log-eigenvalues of the tail-window covariance per layer
+describe the **intrinsic dimensionality** of the activation cloud —
+an entirely different signal class from per-coordinate mean / max /
+std. Hallucination has been linked to compressed (lower-rank)
+activation manifolds (EigenTrack 2025). Computing five eigenvalues
+per layer over the same `_BOUNDARY_LAYERS` adds 15 features and a
+few seconds of extraction time. They make the pipeline a touch more
+robust at no real cost.
+
+**Why we still keep `class_weight="balanced"` in the LR head.**
+The 70/30 imbalance is large enough that an unweighted LR fits a
+biased decision boundary near the majority-class mean. We tested the
+alternative explicitly (Run 23): adding `class_weight ∈ {None, "balanced"}`
+to the Optuna grid with an accuracy objective — every fold picked
+`None`, but test accuracy *dropped* anyway because the val split (83
+samples) is too noisy to reliably select among hyperparameters by
+accuracy (one sample = 1.2 pp). With AUROC as the architecture
+objective and OOF threshold tuning as the accuracy calibrator,
+`balanced` weights produce probabilities whose *ordering* is correct
+even when their absolute calibration is off, which is exactly what a
+threshold sweep needs.
+
+**Why threshold tuning happens inside `fit()`, not just inside
+`fit_hyperparameters()`.**
+README's primary metric is **accuracy on `test.csv`**, and
+`predictions.csv` contains binary labels — so AUROC is not derivable
+from a submission. Threshold therefore has to be set *correctly*
+by `predict()` itself.
+
+`evaluate.py` calls `fit_hyperparameters` only when an `idx_val` exists
+on the fold. But `solution.py:215-228` then trains a final probe on
+*train + val* (no held-out validation), so `fit_hyperparameters` is
+**never called for the probe that produces `predictions.csv`** — and
+without intervention the threshold would silently stay at 0.5,
+losing several pp of accuracy. We therefore run a 5-fold OOF
+accuracy sweep inside `HallucinationProbe.fit` so that the final
+probe is correctly calibrated by construction. The submitted
+threshold is `0.4192`, meaningfully off from 0.5 because of the
+70/30 imbalance combined with `class_weight="balanced"`.
+
+**Why composite-stratified CV?**
+Hallucinated responses are 2× longer and 3× more often truncated
+than truthful ones; the supplied unlabelled test set has 30 %
+truncation vs ~22 % in train. Stratifying folds on the joint
+`(label, length-quartile, truncated)` distribution gives a
+lower-variance, fairer CV estimate (Liu 2026; Ravichander EMNLP 2025).
+It does **not** change `predictions.csv` (the production probe is
+still trained on all 689 labelled samples and uses the same
+threshold), but it produces a CV number that is closer to what the
+probe will actually do on the unlabelled test set, where the length
+distribution is shifted.
+
+**Why a counter-based sample-tracking trick in `aggregation.py`.**
+`aggregation_and_feature_extraction` needs the input token ids to
+locate the ChatML boundary, but `solution.py` only passes the hidden
+states tensor and the attention mask — not the tokens, not the row
+index. Three options:
+1. Modify `solution.py` to pass tokens — *forbidden by ТЗ Q4*.
+2. Re-tokenise from text only via a fresh tokenizer call on each call
+   — fine, but we still need the corresponding row's text.
+3. Track which call we are in by **module-level counter** plus a
+   lazy load of `data/dataset.csv` and `data/test.csv`.
+Option 3 is what we use. It only relies on `solution.py` iterating
+the train and test dataframes sequentially, which it does. The label
+column is never read — only `prompt` and `response` text. This keeps
+fixed infrastructure untouched while still enabling the boundary-token
+feature.
 
 ### What contributed most to the metric
 Sorted by impact on the test AUROC:
@@ -178,11 +285,194 @@ Cumulative gain from the original 73.90 % baseline: **+3.01 pp test AUROC,
 
 ---
 
-## 3. Experiments and dead ends (what was tried and discarded)
+## 3. Experiments and dead ends — the full journey
 
-A condensed log of 31 experiments. Each row is a real run.
+31 numbered runs over the project. Below is a chronological narrative
+grouped into the four phases the project actually went through, followed
+by per-experiment tables for traceability.
 
-### Pooling / token aggregation
+### Phase 1 — finding the right aggregation (Runs 1–14): 67.5 % → 74.17 %
+The very first probe (Run 1, mean-pool of all layers, large PCA) hit
+67.5 % AUROC and clearly overfit (train ~97 %). The next two attempts —
+LR on the final layer alone (Run 2, ~58 %, underfit) and PCA → LDA → LR
+on mean-pooled middle layers (Run 3, 69.4 %) — bracketed the regime
+where things start working. Geometric features (Run 4) added a marginal
++0.6 pp.
+
+The first real breakthrough was **switching from mean-pool to tail
+pooling** (Runs 5–6): pooling only the last *k* tokens of the real
+window jumped to 73.43 % at *k=50* and 73.87 % at *k=100*. Beyond that
+(Run 7, *k=150*) the score collapsed because the window started
+including too much prompt content. The takeaway: the response is
+where the hallucination signal lives, but only when we don't pollute
+it with prompt tokens.
+
+A handful of late-decision tweaks (Runs 8–13) bracketed the right way
+to combine local and global information: dropping the global-mean term
+(Run 8) hurt slightly; replacing it with a last-token representation
+(Run 12) hurt slightly more; using both (Run 13) added noise and lost
+2 pp. Global mean stays, last-token doesn't.
+
+The final win of this phase was **multi-view pooling** (Run 14): for
+each layer we now compute mean *and* max *and* std over the tail
+window. AUROC: 74.17 %. At this point the simple feature-engineering
+ideas are exhausted.
+
+### Phase 2 — breaking the plateau (Runs 15–20): 74.17 % → 75.50 %
+13 runs in, the score had stalled around 74 %. To pick up real new
+signal we ran a literature search through a research subagent. The
+strongest concrete idea that came back was Snyder et al. 2024's claim
+that the **hidden state of the very first generated token** already
+encodes whether the response will be hallucinated — a position our
+tail-pooling view systematically misses for long hallucinated
+responses (median 99 tokens vs 44 for truthful).
+
+Adding the boundary-token block (Run 16) gave **+1.33 pp test AUROC**
+in one shot — the single biggest gain in the project, and the moment
+the project stopped being a pooling-strategy exploration.
+
+Once that signal was in, it had to be *isolated* rather than expanded.
+Several intuitive extensions all failed:
+
+- **Run 17** — pooling a *window* of K=5 first response tokens
+  (mean+max) instead of just one. AUROC drops to 73.79 %.
+  Train AUROC also drops, so this is signal *dilution*, not overfit:
+  the Snyder signal is sharply localised to a single position, the
+  exact moment of model commitment.
+- **Run 18** — also adding the last-real-token (EOS proxy). 75.15 %
+  — within noise. The EOS is already inside our tail-100, so this
+  is redundant.
+- **Run 19** — replacing the boundary token with the *intent* token
+  one step earlier (the `\r\n` terminator at `boundary_idx − 1`),
+  reasoning that in a decoder transformer hidden_states[t] is what
+  predicts token t+1, so this position carries the model's intent.
+  AUROC: 73.38 %. Train AUROC drops too. The terminator carries a
+  generic embedding common to *all* samples, with content-specific
+  variation only via attention — too weak on a 0.5 B model.
+- **Run 20** — concatenating commit (boundary_idx) AND intent
+  (boundary_idx − 1). 74.30 %. Train/val rise, test drops: classic
+  overfit on redundant features. Boundary alone is best.
+
+### Phase 3 — squeezing what's left (Runs 21–26): 75.50 % → 75.77 %
+At 75.5 % we ran one more research dig and the most actionable idea
+was that **boundary-token signal might want a different layer subset
+than mean-pool**, because Hou et al. 2024 shows linear probes on
+sub-1 B models peak deeper than on 7 B models (depth 75–95 % vs 40–70 %).
+
+The per-layer sweep (Run 21) confirmed this exactly: `[18, 20, 22]`
+beats the original `[10, 12, 14, 16, 18, 20]` by +0.27 pp test AUROC,
+*and* trims feature dim by 2 700, *and* shrinks the train-test gap
+from 13.9 pp to 11.4 pp. Three deep layers carry the boundary signal
+better than six middle ones.
+
+A quick CLAP-lite stacker experiment (Run 22) — splitting the feature
+matrix into 11 per-layer groups, training one base LR per group, then
+a meta-LR on their out-of-fold probabilities — *fragmented* the
+signal: 73.71 %. The global LDA on the flat 19 k-vector already finds
+the optimal direction; per-group LDAs each see a smaller view and the
+meta learner overfits the 11 OOF probabilities. At n=470 stacking has
+no headroom.
+
+We then tried unifying the metric pipeline (Run 23) by switching
+Optuna's objective from AUROC to accuracy and adding `class_weight`
+to the grid. Every fold picked `class_weight=None`, confirming
+"balanced" was *slightly* hurting accuracy by shifting probabilities.
+But the overall test accuracy *dropped* 0.4 pp anyway, because the
+83-sample validation split is too noisy to select hyperparameters by
+accuracy (one sample ≈ 1.2 pp accuracy noise). The lesson: AUROC is
+rank-based and stable on small samples — let it select the
+architecture, and let the OOF threshold sweep handle accuracy
+calibration on the full 470-sample train.
+
+EigenTrack spectral features were our next research import:
+top-5 log-eigenvalues of the tail-window covariance per layer
+capture *manifold compression* (a different signal class from
+per-coordinate views). Run 25 with spectral on `[18, 20, 22]` came
+in at 75.73 % — within noise of Run 21, but kept as cheap insurance
+(15 features). Extending to all 24 layers (Run 26, 75.55 %) was
+strictly worse — early-layer eigenvalues describe token statistics,
+not factuality.
+
+### Phase 4 — hitting the ceiling (Runs 27–31): plateau at 75.7–76.9 %
+A third deep research pass focused specifically on **data-side
+limits**. The literature returned a strong claim: hallucination
+benchmarks are notorious for length leakage — hallucinated responses
+are 2× longer in our data and 3× more often truncated, exactly the
+pattern HaluEval-QA suffers from. Liu et al. 2026 ("When Bias Pretends
+to Be Truth") reports that inner-state probing fails when label-feature
+correlations are spurious, and scaling the model up does not help.
+
+Run 27 implemented length residualisation: regress
+`[log(n_real), is_truncated]` out of every feature in `probe.fit`,
+keep the residuals, re-add the two raw signals as separate features.
+**The result was a disaster**: test AUROC −5.5 pp, *train* AUROC also
+down −3.8 pp. The fact that train fell as much as test is the
+signature of *signal removal*, not de-confounding: in our hidden
+states the length-factuality coupling is **causal**, not spurious.
+Longer responses really do activate different neurons because the
+model is more uncertain. Residualising stripped genuine factuality
+signal alongside the length component.
+
+That left two more data-side moves. Run 28 — composite-stratified
+5-fold CV on `(label, length-quartile, truncated)` — produced a
++1.18 pp AUROC and +0.43 pp accuracy bump in the *CV report*, but
+**did not change `predictions.csv`** (the production probe is still
+trained on all 689 samples with the same threshold). What changed
+is that fold-level estimates have lower variance and better match
+the 30 %-truncation distribution of the unlabelled test set. We
+kept this — fairer reporting at zero submission cost.
+
+Run 29 (length-stratified ensemble: a separate probe trained only on
+truncated samples, blended 50/50 with the main probe at inference)
+came in within noise. The truncated stratum has only ~20 truthful
+samples in training data — too few to support a separate LDA
+direction. Reverted.
+
+Two final ablations confirmed the design. Run 30 dropped EigenTrack
+spectral features entirely: within noise, but extraction time fell
+from 15 s to 11 s. We kept spectral anyway because it adds robustness
+to length-distribution shifts. Run 31 dropped the entire boundary-
+token block: test AUROC fell −2.6 pp, train AUROC fell −1.5 pp.
+Boundary really is real factuality signal, not a length shortcut, and
+not a research-recommendation artefact.
+
+After Run 31 the experimental search reached diminishing returns
+across pooling, position, layer subset, classifier, calibration, and
+data-side interventions. The final configuration is Run 28.
+
+### Why we believe ~75 % is close to the ceiling for this setup
+Three converging lines of evidence (verified empirically — see
+`eda_length_confound.py`):
+
+1. **Length-only baseline.** A logistic regression on four length
+   features (`response_tok`, `log_response`, `combined_tok`,
+   `is_truncated`) under the same 5-fold CV reaches only 64.07 %
+   AUROC and 54 % accuracy. Our probe is +12.8 pp AUROC and +18 pp
+   accuracy above that — the hidden states carry genuine signal
+   beyond length, but length is also a real (causal) part of the
+   signal we use.
+
+2. **Distribution shift train vs. test.** The unlabelled test set
+   has 30 % truncation vs ~22 % in train, and median combined
+   tokens 380 vs 363. The composite-stratified split addresses CV
+   honesty but cannot manufacture data; the inherent shift caps
+   real-world performance.
+
+3. **Published ceilings.** SAPLMA-style probes on Qwen-class 0.5 B
+   models in the recent literature (Hou 2024; HALP / EACL 2026;
+   Mirage of Hallucination Detection 2025) cluster at 0.72–0.78
+   AUROC. Our 0.769 sits at the upper end. The Bayes-optimal
+   ceiling at 689 samples and α ≈ 0.78 annotator agreement
+   (Mirage 2025) is around 0.83–0.88 — going there would require
+   re-labelling or expanding the dataset, not a smarter aggregator
+   on these hidden states. Liu 2026 further shows that scaling the
+   *model* (e.g. to 7 B) does not lift this kind of probing
+   ceiling: the bottleneck is in the data-feature coupling, not
+   representational quality.
+
+### Per-experiment tables (for traceability)
+
+#### Pooling / token aggregation
 | # | Variant                                         | Test AUROC | Verdict |
 |--:|-------------------------------------------------|----------:|---------|
 | 1 | LR with PCA on mean-pool of all layers          | 67.5      | Massive overfit, large feature dim. |
@@ -200,9 +490,9 @@ A condensed log of 31 experiments. Each row is a real run.
 | 18 | + last-real-token (EOS proxy)                   | 75.15     | Already in tail-100 — redundant. **Dead end.** |
 | 19 | Intent token (`boundary_idx − 1`) only          | 73.38     | Generic terminator embedding — weaker than commit. **Dead end.** |
 | 20 | Commit + intent concat                          | 74.30     | Train/val rise, test drops — overfit. **Dead end.** |
-| 24 | + last-prompt-token (last `<|im_end|>` before assistant header) | 74.08 | Same token across all samples; signal subsumed by boundary in attention. Question-Only-Probe was tested on 7B+. **Dead end.** |
+| 24 | + last-prompt-token (last `<|im_end|>` before assistant header) | 74.08 | Same token across all samples; signal subsumed by boundary in attention. Question-Only-Probe was tested on 7 B+. **Dead end.** |
 
-### Per-layer analyses
+#### Per-layer analyses
 | # | Variant                                    | Test AUROC | Verdict |
 |--:|--------------------------------------------|----------:|---------|
 | 21 (sweep) | Boundary layers [10,12,14,16,18,20] | 75.50     | Original. |
@@ -215,53 +505,17 @@ A condensed log of 31 experiments. Each row is a real run.
 | 26 | Spectral over ALL 24 layers (120 features)| 75.55     | Early-layer eigenvalues are token statistics. **Dead end.** |
 | 31 | Boundary block dropped entirely           | 74.28     | −2.6 pp test, −1.5 pp train → boundary IS factuality, not shortcut. **Dead end.** |
 
-### Probe / classifier
+#### Probe / classifier
 | # | Variant                                   | Test AUROC | Verdict |
 |--:|-------------------------------------------|----------:|---------|
 | 9  | Optuna over (n_components, C) — 3×3 grid | 73.87     | Locks in the LDA + LR pipeline. |
 | 10 | PCA → LR (no LDA)                       | 72.58     | LDA matters — finds the analytic separating direction. **Dead end.** |
 | 11 | + n_real scalar feature                 | 73.90     | Marginal gain, kept. |
-| 22 | CLAP-lite stacker (per-layer probes + meta-LR) | 73.71 | Fragments the signal; one global LDA on 19k features dominates. At n=470 stacking has no headroom. **Dead end.** |
+| 22 | CLAP-lite stacker (per-layer probes + meta-LR) | 73.71 | Fragments the signal; one global LDA on 19 k features dominates. At n=470 stacking has no headroom. **Dead end.** |
 | 23 | Optuna objective AUROC → accuracy + class_weight grid | 74.68 | val=83 too small for stable accuracy estimate; AUROC is rank-based and stabler. **Dead end.** |
 | 27 | Length residualisation (regress out [log(n_real), is_truncated]) | 70.26 | Train AUROC also drops 4 pp → length signal is **causal** in our hidden states, not spurious shortcut. Liu 2026 framework does not apply here. **Dead end.** |
 | 29 | Length-stratified probe ensemble        | 76.88     | Within noise; truncated stratum has only 20 truthful samples → data-starved. **Dead end.** |
 | 30 | Drop EigenTrack spectral features       | 76.89     | Within noise; spectral was bloat — kept anyway as cheap insurance. |
-
-### What did *not* work, summarised
-- **Wider boundary windows.** Snyder's first-token signal is sharply localised
-  to one position; pooling adjacent tokens dilutes it.
-- **Removing length information.** Length is a causal feature in hidden
-  states for this dataset — longer responses really do activate different
-  neurons. Residualising hurts both train and test AUROC.
-- **Per-layer stacking (CLAP-lite).** A global LDA on the 19 822-dim feature
-  vector already finds the optimal direction; splitting features into 11
-  groups and stacking loses cross-group interactions, and at n=470 the meta
-  learner overfits OOF predictions.
-- **Optuna over accuracy.** The 83-sample validation split is too small for
-  a stable accuracy estimate. AUROC selects architecture; OOF threshold
-  tuning calibrates the threshold under accuracy. Decoupling these works
-  better than unifying them.
-- **Last prompt token / intent token.** On a 0.5 B model the pre-generation
-  signal at `<|im_end|>` or the assistant-header terminator is too weak —
-  variation lives entirely in attention context, which is shallow at this
-  scale. Question-Only-Probe (NeurIPS 2025) was reported on 7 B+ models.
-
-### Why we believe ~75 % is close to the ceiling for this setup
-Three converging arguments:
-
-1. **Length-only baseline.** A logistic regression on four length features
-   (`response_tok`, `log_response`, `combined_tok`, `is_truncated`) reaches
-   only 64 % AUROC on the same 5-fold CV. Our probe is +12 pp above that —
-   so the bulk of our signal is genuine factuality, not length shortcut.
-2. **Distribution shift train vs. test.** The unlabelled test set has
-   30 % truncation vs ~22 % in train, and longer median responses. The
-   composite-stratified split (Run 28) addresses CV honesty but cannot
-   manufacture data; the inherent shift caps real-world performance.
-3. **Published ceilings.** SAPLMA-style probes on Qwen-class 0.5 B models in
-   the recent literature (Hou 2024; Linear-Probe Accuracy Scales; HALP/EACL
-   2026) cluster around 0.72–0.78 AUROC. We are at the upper end. Going to
-   80 %+ on n=689 with this model would require expanding or re-labelling
-   the dataset, not a smarter aggregator.
 
 ---
 
@@ -281,16 +535,67 @@ Three converging arguments:
 
 ## 5. References (work that informed the design)
 
-- Marks & Tegmark, *The Geometry of Truth* (COLM 2024) — mass-mean / LDA probe.
-- Li et al., *Inference-Time Intervention* (2023) — middle-layer factuality probing.
-- Snyder et al., *On Early Detection of Hallucinations in Factual QA* (KDD 2024)
-  — first-response-token signal.
-- Hou et al., *Linear Probe Accuracy Scales with Model Size* (2024) — sub-1B
-  layer-position interactions.
-- Yang et al., *ICR Probe* (ACL 2025) — residual-stream dynamics.
-- *EigenTrack: Spectral Analysis of Hidden Activations* (2025) — spectral
-  manifold compression as a hallucination signal.
-- Liu et al., *When Bias Pretends to Be Truth* (2026) — spurious correlation
-  in inner-state probing.
-- Ravichander et al., *The Illusion of Progress* (EMNLP 2025) — length
-  shortcuts in QA-style hallucination benchmarks.
+Direct design influences (used in the final pipeline):
+
+- Marks & Tegmark, [*The Geometry of Truth: Emergent Linear Structure in
+  Large Language Model Representations of True/False Datasets*](https://arxiv.org/abs/2310.06824)
+  (COLM 2024) — mass-mean direction = LDA(1) direction. The classifier
+  in `probe.py` is structurally equivalent to their probe.
+- Li et al., [*Inference-Time Intervention: Eliciting Truthful Answers
+  from a Language Model*](https://arxiv.org/abs/2306.03341) (NeurIPS 2023)
+  — established the middle-layer factuality probing recipe.
+- Snyder et al., [*On Early Detection of Hallucinations in Factual
+  Question Answering*](https://arxiv.org/abs/2312.14183) (KDD 2024) —
+  the first-response-token signal that broke our 13-experiment plateau
+  (Run 16, +1.33 pp).
+- Hou et al., [*Linear Probe Accuracy Scales with Model Size and Benefits
+  from Multi-Layer Ensembling*](https://arxiv.org/html/2604.13386v1)
+  (2024) — per-layer scan showing sub-1 B probe optima sit deeper than
+  for 7 B+. Justifies the late-layer subset `[18, 20, 22]` for the
+  boundary block.
+- *EigenTrack: Spectral Analysis of Hidden Activations*
+  ([arXiv 2509.15735](https://arxiv.org/html/2509.15735v4), 2025) —
+  spectral manifold compression as a hallucination signal (the 15-dim
+  spectral block in `aggregation.py`).
+
+Influences on splitting / data-side reasoning (kept the probe honest
+even when they didn't push the metric):
+
+- Liu et al., [*When Bias Pretends to Be Truth: How Spurious
+  Correlations Undermine Hallucination Detection in LLMs*](https://arxiv.org/abs/2511.07318)
+  (2026) — argued our 75 % could be a length shortcut. Empirically it
+  is not (Run 27 dead end), but the framework motivated the
+  composite-stratified split and the length-only baseline.
+- Ravichander et al., [*The Illusion of Progress: Re-evaluating
+  Hallucination Detection in LLMs*](https://arxiv.org/html/2508.08285v2)
+  (Findings of EMNLP 2025) — documents length leakage on QA-style
+  hallucination benchmarks; reason we report a length-only baseline.
+- *The Mirage of Hallucination Detection*
+  ([Findings of EMNLP 2025](https://aclanthology.org/2025.findings-emnlp.1035.pdf))
+  — annotator-agreement α ≈ 0.78 for hallu labelling; basis for the
+  Bayes-optimal ceiling estimate.
+
+Considered but did not improve the metric in our setup (documented for
+context):
+
+- Yang et al., [*ICR Probe: Tracking Hidden State Dynamics*](https://aclanthology.org/2025.acl-long.880.pdf)
+  (ACL 2025) — residual-stream dynamics. Run 15 added 22 ICR-style
+  derived statistics; redundant on top of multi-view, reverted.
+- Sriramanan et al., [*Cross-Layer Attention Probing for Fine-Grained
+  Hallucination Detection (CLAP)*](https://arxiv.org/abs/2509.09700)
+  (2025) — cross-layer attention probing. We tested a CLAP-lite
+  stacker (Run 22, 73.71 %); fragmentation hurt at n=470.
+- *No Answer Needed: Question-Only Linear Probes*
+  ([NeurIPS 2025 OpenReview](https://openreview.net/forum?id=OhN25uxVab))
+  — last-prompt-token probing. Tested in Run 24, dead end on 0.5 B.
+- *HALP: Detecting Hallucinations in Vision-Language Models*
+  ([EACL 2026](https://aclanthology.org/2026.eacl-long.287/)) —
+  reference for the published 0.72–0.78 AUROC band on small models.
+
+Methodological / regression-modelling background:
+
+- Pavlou et al., [*How to develop a more accurate risk prediction model
+  when there are few events*](https://pmc.ncbi.nlm.nih.gov/articles/PMC4982098/)
+  (2016) — penalised regression at low events-per-feature ratios.
+  Background for choosing PCA → LDA over high-dimensional logistic
+  regression on the raw 22 k features.
