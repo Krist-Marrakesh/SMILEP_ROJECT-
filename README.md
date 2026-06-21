@@ -1,4 +1,4 @@
-# 🔍 SMILES-2026 Hallucination Detection
+#  SMILES-2026 Hallucination Detection
 
 Detect whether a small language
 model's answer is *hallucinated* (fabricated) or *truthful* using the model's
